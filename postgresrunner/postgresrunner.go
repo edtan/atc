@@ -97,7 +97,7 @@ func (runner Runner) Run(signals <-chan os.Signal, ready chan<- struct{}) error 
 }
 
 func (runner *Runner) MigrateToVersion(version int) {
-	err := migration.NewOpenHelper(
+	err := migration.NewDbHelper(
 		"postgres",
 		runner.DataSourceName(),
 		nil,
@@ -107,7 +107,7 @@ func (runner *Runner) MigrateToVersion(version int) {
 }
 
 func (runner *Runner) TryOpenDBAtVersion(version int) (*sql.DB, error) {
-	dbConn, err := migration.NewOpenHelper(
+	dbConn, err := migration.NewDbHelper(
 		"postgres",
 		runner.DataSourceName(),
 		nil,
@@ -132,7 +132,7 @@ func (runner *Runner) OpenDBAtVersion(version int) *sql.DB {
 }
 
 func (runner *Runner) OpenDB() *sql.DB {
-	dbConn, err := migration.NewOpenHelper(
+	dbConn, err := migration.NewDbHelper(
 		"postgres",
 		runner.DataSourceName(),
 		nil,
