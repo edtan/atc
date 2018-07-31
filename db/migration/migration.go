@@ -3,10 +3,7 @@ package migration
 import (
 	"database/sql"
 	"fmt"
-	"regexp"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
 
 	"code.cloudfoundry.org/lager"
@@ -182,7 +179,7 @@ func (self *migrator) Migrate(toVersion int) error {
 		defer lock.Release()
 	}
 
-	_, err = self.db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version bigint, tstamp timestamp with time zone, direction varchar, status varchar)")
+	_, err = self.db.Exec("CREATE TABLE IF NOT EXISTS schema_migrations (version bigint, tstamp timestamp with time zone, direction varchar, status varchar, dirty boolean)")
 	if err != nil {
 		return err
 	}
@@ -199,12 +196,10 @@ func (self *migrator) Migrate(toVersion int) error {
 		return err
 	}
 
-	fmt.Printf("currentVersion: %d toVersion %d\n", currentVersion, toVersion)
 	if currentVersion <= toVersion {
 		for _, m := range migrations {
 			if currentVersion < m.Version && m.Version <= toVersion && m.Direction == "up" {
-				// fmt.Printf("running migration up: %d\n", m.Version)
-				err = m.run()
+				err = self.runMigration(m)
 				if err != nil {
 					return err
 				}
@@ -213,8 +208,7 @@ func (self *migrator) Migrate(toVersion int) error {
 	} else {
 		for i := len(migrations) - 1; i >= 0; i-- {
 			if currentVersion >= migrations[i].Version && migrations[i].Version > toVersion && migrations[i].Direction == "down" {
-				// fmt.Printf("running migration down: %d\n", migrations[i].Version)
-				err = migrations[i].run()
+				err = self.runMigration(migrations[i])
 				if err != nil {
 					return err
 				}
@@ -224,108 +218,71 @@ func (self *migrator) Migrate(toVersion int) error {
 	return nil
 }
 
-// func (self *migrator) migrationExists(schemaVersion int) (bool, error) {
-// 	var migrationCount int
-// 	err := self.db.QueryRow("SELECT COUNT(*) FROM schema_migrations where version=$1", schemaVersion).Scan(&migrationCount)
-// 	if err != nil {
-// 		return false, err
-// 	}
-// 	return migrationCount == 1, nil
-// }
+type Strategy int
 
-func schemaVersion(assetName string) (int, error) {
-	regex := regexp.MustCompile("(\\d+)")
-	match := regex.FindStringSubmatch(assetName)
-	return strconv.Atoi(match[1])
-}
+const (
+	GoMigration Strategy = iota
+	SQLTransaction
+	SQLNoTransaction
+)
 
 type migration struct {
-	Version             int
-	run                 func() error
-	Direction           string
-	MigrationStatements []string
+	Name       string
+	Version    int
+	Direction  string
+	Statements []string
+	Strategy   Strategy
+}
+
+func (m *migrator) recordMigrationFailure(migration migration, err error, dirty bool) error {
+	_, dbErr := m.db.Exec("INSERT INTO schema_migrations (version, tstamp, direction, status, dirty) VALUES ($1, current_timestamp, $2, 'failed', $3)", migration.Version, migration.Direction, dirty)
+	return multierror.Append(fmt.Errorf("Migration '%s' failed: %v", migration.Name, err), dbErr)
+}
+
+func (m *migrator) runMigration(migration migration) error {
+	var err error
+
+	switch migration.Strategy {
+	case GoMigration:
+		err = migrations.NewMigrations(m.db, m.strategy).Run(migration.Name)
+		if err != nil {
+			return m.recordMigrationFailure(migration, err, false)
+		}
+	case SQLTransaction:
+		tx, err := m.db.Begin()
+		for _, statement := range migration.Statements {
+			_, err = tx.Exec(statement)
+			if err != nil {
+				tx.Rollback()
+				err = multierror.Append(fmt.Errorf("Transaction %v failed, rolled back the migration", statement), err)
+				if err != nil {
+					return m.recordMigrationFailure(migration, err, false)
+				}
+			}
+		}
+		err = tx.Commit()
+	case SQLNoTransaction:
+		_, err = m.db.Exec(migration.Statements[0])
+		if err != nil {
+			return m.recordMigrationFailure(migration, err, true)
+		}
+	}
+
+	_, err = m.db.Exec("INSERT INTO schema_migrations (version, tstamp, direction, status, dirty) VALUES ($1, current_timestamp, $2, 'passed', false)", migration.Version, migration.Direction)
+	return err
 }
 
 func (self *migrator) Migrations() ([]migration, error) {
 	migrationList := []migration{}
 	assets := self.bindata.AssetNames()
+	var parser = NewParser(self.bindata)
 	for _, assetName := range assets {
-		asset, err := self.bindata.Asset(assetName)
+		parsedMigration, err := parser.ParseFileToMigration(assetName)
 		if err != nil {
 			return nil, err
 		}
-		version, err := schemaVersion(assetName)
-		if err != nil {
-			return nil, err
-		}
-		var m migration
-		var runFunc func() error
-		var direction string
-		var migrationStatements []string
 
-		if strings.HasSuffix(assetName, ".go") {
-			if strings.HasSuffix(assetName, ".up.go") {
-				direction = "up"
-			} else if strings.HasSuffix(assetName, ".down.go") {
-				direction = "down"
-			} else {
-				return nil, fmt.Errorf("cannot determine migration direction for file '%s'", assetName)
-			}
-			runFunc = func() error {
-				contents := string(asset)
-				re := regexp.MustCompile("(Up|Down)_[0-9]*")
-				name := re.FindString(contents)
-				err := migrations.NewMigrations(self.db, self.strategy).Run(name)
-				return err
-			}
-		}
-		if strings.HasSuffix(assetName, ".sql") {
-			if strings.HasSuffix(assetName, ".up.sql") {
-				direction = "up"
-			} else if strings.HasSuffix(assetName, ".down.sql") {
-				direction = "down"
-			} else {
-				return nil, fmt.Errorf("cannot determine migration direction for file '%s'", assetName)
-			}
-
-			var parser = NewSqlParser()
-
-			migrationFileContents, _ := Asset(assetName)
-			migrationStatements, err = parser.ParseFile(string(migrationFileContents))
-			if err != nil {
-				return nil, err
-			}
-			runFunc = func() error {
-				// if strings.Contains(migrationStatements[0], "NO_TRANSACTION") {
-				// 	_, err := self.db.Exec(migrationFileContents)
-				// 	return err
-				// } else {
-
-				tx, err := self.db.Begin()
-				for _, statement := range migrationStatements {
-					_, err := tx.Exec(statement)
-					if err != nil {
-						tx.Rollback()
-						return multierror.Append(fmt.Errorf("Transaction %v failed, rolled back the migration", statement), err)
-					}
-				}
-				err = tx.Commit()
-				return err
-				// }
-			}
-
-		}
-		runFuncWrapper := func() error {
-			err := runFunc()
-			if err != nil {
-				_, errDb := self.db.Exec("INSERT INTO schema_migrations (version, tstamp, direction, status) VALUES ($1, current_timestamp, $2, 'failed')", version, direction)
-				return multierror.Append(fmt.Errorf("Migration '%s' failed: %v", assetName, err), errDb)
-			}
-			_, err = self.db.Exec("INSERT INTO schema_migrations (version, tstamp, direction, status) VALUES ($1, current_timestamp, $2, 'passed')", version, direction)
-			return err
-		}
-		m = migration{version, runFuncWrapper, direction, migrationStatements}
-		migrationList = append(migrationList, m)
+		migrationList = append(migrationList, parsedMigration)
 	}
 	sort.Slice(migrationList, func(i, j int) bool { return migrationList[i].Version < migrationList[j].Version })
 
@@ -395,7 +352,7 @@ func (self *migrator) convertLegacySchemaTableToCurrent() error {
 		return err
 	}
 
-	_, err = self.db.Exec("INSERT INTO schema_migrations (version, tstamp, direction) VALUES ($1, current_timestamp, 'up')", newMigrationStartVersion)
+	_, err = self.db.Exec("INSERT INTO schema_migrations (version, tstamp, direction, status, dirty) VALUES ($1, current_timestamp, 'up', 'passed', false)", newMigrationStartVersion)
 	if err != nil {
 		return err
 	}
